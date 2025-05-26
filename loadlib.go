@@ -63,6 +63,36 @@ func OpenPackage(L *LState) int {
 		return 0
 	}
 
+	registry := L.Get(RegistryIndex)
+	if registry == nil {
+		registry = L.NewTable()
+		L.Replace(RegistryIndex, registry)
+	}
+
+	registryTable, ok := registry.(*LTable)
+	if !ok {
+		registryTable = L.NewTable()
+		L.Replace(RegistryIndex, registryTable)
+	}
+
+	loaded := L.NewTable()
+	if loaded == nil {
+		return 0
+	}
+	L.SetField(registryTable, "_LOADED", loaded)
+
+	globals := L.Get(GlobalsIndex)
+	if globals == nil {
+		globals = L.NewTable()
+		L.Replace(GlobalsIndex, globals)
+	}
+
+	globalsTable, ok := globals.(*LTable)
+	if !ok {
+		globalsTable = L.NewTable()
+		L.Replace(GlobalsIndex, globalsTable)
+	}
+
 	packagemod := L.RegisterModule(LoadLibName, loFuncs)
 	if packagemod == nil {
 		return 0
@@ -87,15 +117,9 @@ func OpenPackage(L *LState) int {
 	}
 
 	L.SetField(packagemod, "loaders", loaders)
-	L.SetField(L.Get(RegistryIndex), "_LOADERS", loaders)
-
-	loaded := L.NewTable()
-	if loaded == nil {
-		return 0
-	}
+	L.SetField(registryTable, "_LOADERS", loaders)
 
 	L.SetField(packagemod, "loaded", loaded)
-	L.SetField(L.Get(RegistryIndex), "_LOADED", loaded)
 
 	path := loGetPath(LuaPath, LuaPathDefault)
 	if path == "" {
