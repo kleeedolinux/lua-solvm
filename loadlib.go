@@ -59,12 +59,30 @@ func loFindFile(L *LState, name, pname string) (string, string) {
 }
 
 func OpenPackage(L *LState) int {
-	packagemod := L.RegisterModule(LoadLibName, loFuncs)
+	if L == nil {
+		return 0
+	}
 
-	L.SetField(packagemod, "preload", L.NewTable())
+	packagemod := L.RegisterModule(LoadLibName, loFuncs)
+	if packagemod == nil {
+		return 0
+	}
+
+	preload := L.NewTable()
+	if preload == nil {
+		return 0
+	}
+	L.SetField(packagemod, "preload", preload)
 
 	loaders := L.CreateTable(len(loLoaders), 0)
+	if loaders == nil {
+		return 0
+	}
+
 	for i, loader := range loLoaders {
+		if loader == nil {
+			continue
+		}
 		L.RawSetInt(loaders, i+1, L.NewFunction(loader))
 	}
 
@@ -72,12 +90,20 @@ func OpenPackage(L *LState) int {
 	L.SetField(L.Get(RegistryIndex), "_LOADERS", loaders)
 
 	loaded := L.NewTable()
+	if loaded == nil {
+		return 0
+	}
+
 	L.SetField(packagemod, "loaded", loaded)
 	L.SetField(L.Get(RegistryIndex), "_LOADED", loaded)
 
-	L.SetField(packagemod, "path", LString(loGetPath(LuaPath, LuaPathDefault)))
+	path := loGetPath(LuaPath, LuaPathDefault)
+	if path == "" {
+		path = LuaPathDefault
+	}
+	L.SetField(packagemod, "path", LString(path))
 	L.SetField(packagemod, "cpath", emptyLString)
-	//.
+
 	config := fmt.Sprintf("%s\n%s\n%s\n%s\n%s\n",
 		LuaDirSep,
 		LuaPathSep,
@@ -96,11 +122,24 @@ var loFuncs = map[string]LGFunction{
 }
 
 func loLoaderPreload(L *LState) int {
+	if L == nil {
+		return 0
+	}
+
 	name := L.CheckString(1)
+	if name == "" {
+		return 0
+	}
 
 	preload := L.GetField(L.GetField(L.Get(EnvironIndex), "package"), "preload")
+	if preload == nil {
+		L.RaiseError("package.preload must be a table")
+		return 0
+	}
+
 	if _, ok := preload.(*LTable); !ok {
 		L.RaiseError("package.preload must be a table")
+		return 0
 	}
 
 	lv := L.GetField(preload, name)
@@ -114,10 +153,17 @@ func loLoaderPreload(L *LState) int {
 }
 
 func loLoaderLua(L *LState) int {
+	if L == nil {
+		return 0
+	}
+
 	name := L.CheckString(1)
+	if name == "" {
+		return 0
+	}
 
 	path, msg := loFindFile(L, name, "path")
-	if len(path) == 0 {
+	if path == "" {
 		L.Push(LString(msg))
 		return 1
 	}
@@ -125,6 +171,7 @@ func loLoaderLua(L *LState) int {
 	fn, err := L.LoadFile(path)
 	if err != nil {
 		L.RaiseError(err.Error())
+		return 0
 	}
 
 	L.Push(fn)
@@ -132,16 +179,29 @@ func loLoaderLua(L *LState) int {
 }
 
 func loLoadLib(L *LState) int {
+	if L == nil {
+		return 0
+	}
 	L.RaiseError("loadlib is not supported")
 	return 0
 }
 
 func loSeeAll(L *LState) int {
+	if L == nil {
+		return 0
+	}
+
 	mod := L.CheckTable(1)
+	if mod == nil {
+		return 0
+	}
 
 	mt := L.GetMetatable(mod)
 	if mt == LNil {
 		mt = L.CreateTable(0, 1)
+		if mt == nil {
+			return 0
+		}
 		L.SetMetatable(mod, mt)
 	}
 
