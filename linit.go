@@ -27,8 +27,8 @@ type luaLib struct {
 }
 
 var luaLibs = []luaLib{
-	luaLib{LoadLibName, OpenPackage},
 	luaLib{BaseLibName, OpenBase},
+	luaLib{LoadLibName, OpenPackage},
 	luaLib{TabLibName, OpenTable},
 	luaLib{IoLibName, OpenIo},
 	luaLib{OsLibName, OpenOs},
