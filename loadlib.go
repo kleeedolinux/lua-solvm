@@ -77,7 +77,7 @@ func OpenPackage(L *LState) int {
 
 	L.SetField(packagemod, "path", LString(loGetPath(LuaPath, LuaPathDefault)))
 	L.SetField(packagemod, "cpath", emptyLString)
-
+	//.
 	config := fmt.Sprintf("%s\n%s\n%s\n%s\n%s\n",
 		LuaDirSep,
 		LuaPathSep,
