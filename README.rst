@@ -3,11 +3,11 @@
 GopherLua: VM and compiler for Lua in Go.
 ===============================================================================
 
-.. image:: https://pkg.go.dev/badge/github.com/yuin/gopher-lua.svg
-    :target: https://pkg.go.dev/github.com/yuin/gopher-lua
+.. image:: https://pkg.go.dev/badge/github.com/kleeedolinux/lua-solvm.svg
+    :target: https://pkg.go.dev/github.com/kleeedolinux/lua-solvm
 
-.. image:: https://github.com/yuin/gopher-lua/workflows/test/badge.svg?branch=master&event=push
-    :target: https://github.com/yuin/gopher-lua/actions?query=workflow:test
+.. image:: https://github.com/kleeedolinux/lua-solvm/workflows/test/badge.svg?branch=master&event=push
+    :target: https://github.com/kleeedolinux/lua-solvm/actions?query=workflow:test
 
 .. image:: https://coveralls.io/repos/github/yuin/gopher-lua/badge.svg?branch=master
     :target: https://coveralls.io/github/yuin/gopher-lua
@@ -46,7 +46,7 @@ GopherLua is not fast but not too slow, I think.
 
 GopherLua has almost equivalent ( or little bit better ) performance as Python3 on micro benchmarks.
 
-There are some benchmarks on the `wiki page <https://github.com/yuin/gopher-lua/wiki/Benchmarks>`_ .
+There are some benchmarks on the `wiki page <https://github.com/kleeedolinux/lua-solvm/wiki/Benchmarks>`_ .
 
 ----------------------------------------------------------------
 Installation
@@ -54,7 +54,7 @@ Installation
 
 .. code-block:: bash
 
-   go get github.com/yuin/gopher-lua
+   go get github.com/kleeedolinux/lua-solvm
 
 GopherLua supports >= Go1.9.
 
@@ -71,7 +71,7 @@ Import a package.
 .. code-block:: go
 
    import (
-       "github.com/yuin/gopher-lua"
+       "github.com/kleeedolinux/lua-solvm"
    )
 
 Run scripts in the VM.
@@ -92,9 +92,9 @@ Run scripts in the VM.
        panic(err)
    }
 
-Refer to `Lua Reference Manual <http://www.lua.org/manual/5.1/>`_ and `Go doc <http://godoc.org/github.com/yuin/gopher-lua>`_ for further information.
+Refer to `Lua Reference Manual <http://www.lua.org/manual/5.1/>`_ and `Go doc <http://godoc.org/github.com/kleeedolinux/lua-solvm>`_ for further information.
 
-Note that elements that are not commented in `Go doc <http://godoc.org/github.com/yuin/gopher-lua>`_ equivalent to `Lua Reference Manual <http://www.lua.org/manual/5.1/>`_ , except GopherLua uses objects instead of Lua stack indices.
+Note that elements that are not commented in `Go doc <http://godoc.org/github.com/kleeedolinux/lua-solvm>`_ equivalent to `Lua Reference Manual <http://www.lua.org/manual/5.1/>`_ , except GopherLua uses objects instead of Lua stack indices.
 
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Data model
@@ -244,7 +244,7 @@ Miscellaneous lua.NewState options
 API
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Refer to `Lua Reference Manual <http://www.lua.org/manual/5.1/>`_ and `Go doc(LState methods) <http://godoc.org/github.com/yuin/gopher-lua>`_ for further information.
+Refer to `Lua Reference Manual <http://www.lua.org/manual/5.1/>`_ and `Go doc(LState methods) <http://godoc.org/github.com/kleeedolinux/lua-solvm>`_ for further information.
 
 +++++++++++++++++++++++++++++++++++++++++
 Calling Go from Lua
@@ -343,7 +343,7 @@ mymodule.go
     package mymodule
 
     import (
-        "github.com/yuin/gopher-lua"
+        "github.com/kleeedolinux/lua-solvm"
     )
 
     func Loader(L *lua.LState) int {
@@ -373,7 +373,7 @@ mymain.go
 
     import (
         "./mymodule"
-        "github.com/yuin/gopher-lua"
+        "github.com/kleeedolinux/lua-solvm"
     )
 
     func main() {
@@ -684,7 +684,7 @@ Go API
 
 ``ToChannel``, ``CheckChannel``, ``OptChannel`` are available.
 
-Refer to `Go doc(LState methods) <http://godoc.org/github.com/yuin/gopher-lua>`_ for further information.
+Refer to `Go doc(LState methods) <http://godoc.org/github.com/kleeedolinux/lua-solvm>`_ for further information.
 
 '''''''''''''''
 Lua API
@@ -843,14 +843,14 @@ Lua has an interpreter called ``lua`` . GopherLua has an interpreter called ``gl
 
 .. code-block:: bash
 
-   go get github.com/yuin/gopher-lua/cmd/glua
+   go get github.com/kleeedolinux/lua-solvm/cmd/glua
 
 ``glua`` has same options as ``lua`` .
 
 ----------------------------------------------------------------
 How to Contribute
 ----------------------------------------------------------------
-See `Guidelines for contributors <https://github.com/yuin/gopher-lua/tree/master/.github/CONTRIBUTING.md>`_ .
+See `Guidelines for contributors <https://github.com/kleeedolinux/lua-solvm/tree/master/.github/CONTRIBUTING.md>`_ .
 
 ----------------------------------------------------------------
 Libraries for GopherLua

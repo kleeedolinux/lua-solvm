@@ -4,22 +4,18 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/yuin/gopher-lua/pm"
+	"github.com/kleeedolinux/lua-solvm/pm"
 )
 
 const emptyLString LString = LString("")
 
 func OpenString(L *LState) int {
-	var mod *LTable
-	//_, ok := L.G.builtinMts[int(LTString)]
-	//if !ok {
-	mod = L.RegisterModule(StringLibName, strFuncs).(*LTable)
+	mod := L.RegisterModule(StringLibName, strFuncs).(*LTable)
 	gmatch := L.NewClosure(strGmatch, L.NewFunction(strGmatchIter))
 	mod.RawSetString("gmatch", gmatch)
 	mod.RawSetString("gfind", gmatch)
 	mod.RawSetString("__index", mod)
 	L.G.builtinMts[int(LTString)] = mod
-	//}
 	L.Push(mod)
 	return 1
 }
@@ -45,6 +41,7 @@ func strByte(L *LState) int {
 	start := L.OptInt(2, 1) - 1
 	end := L.OptInt(3, -1)
 	l := len(str)
+
 	if start < 0 {
 		start = l + start + 1
 	}
@@ -74,11 +71,11 @@ func strByte(L *LState) int {
 
 func strChar(L *LState) int {
 	top := L.GetTop()
-	bytes := make([]byte, L.GetTop())
+	bytes := make([]byte, top)
 	for i := 1; i <= top; i++ {
 		bytes[i-1] = uint8(L.CheckInt(i))
 	}
-	L.Push(LString(string(bytes)))
+	L.Push(LString(bytes))
 	return 1
 }
 
@@ -95,11 +92,9 @@ func strFind(L *LState) int {
 		L.Push(LNumber(0))
 		return 2
 	}
+
 	init := luaIndex2StringIndex(str, L.OptInt(3, 1), true)
-	plain := false
-	if L.GetTop() == 4 {
-		plain = LVAsBool(L.Get(4))
-	}
+	plain := L.GetTop() == 4 && LVAsBool(L.Get(4))
 
 	if plain {
 		pos := strings.Index(str[init:], pattern)
@@ -120,9 +115,11 @@ func strFind(L *LState) int {
 		L.Push(LNil)
 		return 1
 	}
+
 	md := mds[0]
 	L.Push(LNumber(md.Capture(0) + 1))
 	L.Push(LNumber(md.Capture(1)))
+
 	for i := 2; i < md.CaptureLength(); i += 2 {
 		if md.IsPosCapture(i) {
 			L.Push(LNumber(md.Capture(i)))
@@ -135,11 +132,13 @@ func strFind(L *LState) int {
 
 func strFormat(L *LState) int {
 	str := L.CheckString(1)
-	args := make([]interface{}, L.GetTop()-1)
 	top := L.GetTop()
+	args := make([]interface{}, top-1)
+
 	for i := 2; i <= top; i++ {
 		args[i-2] = L.Get(i)
 	}
+
 	npat := strings.Count(str, "%") - strings.Count(str, "%%")
 	L.Push(LString(fmt.Sprintf(str, args[:intMin(npat, len(args))]...)))
 	return 1
@@ -161,6 +160,7 @@ func strGsub(L *LState) int {
 		L.Push(LNumber(0))
 		return 2
 	}
+
 	switch lv := repl.(type) {
 	case LString:
 		L.Push(LString(strGsubStr(L, str, string(lv), mds)))
@@ -201,44 +201,53 @@ func capturedString(L *LState, m *pm.MatchData, str string, idx int) string {
 }
 
 func strGsubDoReplace(str string, info []replaceInfo) string {
-	offset := 0
-	buf := []byte(str)
-	for _, replace := range info {
-		oldlen := len(buf)
-		b1 := append([]byte(""), buf[0:offset+replace.Indicies[0]]...)
-		b2 := []byte("")
-		index2 := offset + replace.Indicies[1]
-		if index2 <= len(buf) {
-			b2 = append(b2, buf[index2:len(buf)]...)
-		}
-		buf = append(b1, replace.String...)
-		buf = append(buf, b2...)
-		offset += len(buf) - oldlen
+	if len(info) == 0 {
+		return str
 	}
-	return string(buf)
+
+	var builder strings.Builder
+	builder.Grow(len(str) + len(info)*32)
+
+	last := 0
+	for _, replace := range info {
+		builder.WriteString(str[last:replace.Indicies[0]])
+		builder.WriteString(replace.String)
+		last = replace.Indicies[1]
+	}
+
+	if last < len(str) {
+		builder.WriteString(str[last:])
+	}
+
+	return builder.String()
 }
 
 func strGsubStr(L *LState, str string, repl string, matches []*pm.MatchData) string {
 	infoList := make([]replaceInfo, 0, len(matches))
+
 	for _, match := range matches {
 		start, end := match.Capture(0), match.Capture(1)
+		var builder strings.Builder
+		builder.Grow(len(repl))
+
 		sc := newFlagScanner('%', "", "", repl)
 		for c, eos := sc.Next(); !eos; c, eos = sc.Next() {
 			if !sc.ChangeFlag {
 				if sc.HasFlag {
 					if c >= '0' && c <= '9' {
-						sc.AppendString(capturedString(L, match, str, 2*(int(c)-48)))
+						builder.WriteString(capturedString(L, match, str, 2*(int(c)-48)))
 					} else {
-						sc.AppendChar('%')
-						sc.AppendChar(c)
+						builder.WriteByte('%')
+						builder.WriteByte(c)
 					}
 					sc.HasFlag = false
 				} else {
-					sc.AppendChar(c)
+					builder.WriteByte(c)
 				}
 			}
 		}
-		infoList = append(infoList, replaceInfo{[]int{start, end}, sc.String()})
+
+		infoList = append(infoList, replaceInfo{[]int{start, end}, builder.String()})
 	}
 
 	return strGsubDoReplace(str, infoList)
@@ -246,31 +255,37 @@ func strGsubStr(L *LState, str string, repl string, matches []*pm.MatchData) str
 
 func strGsubTable(L *LState, str string, repl *LTable, matches []*pm.MatchData) string {
 	infoList := make([]replaceInfo, 0, len(matches))
+
 	for _, match := range matches {
 		idx := 0
-		if match.CaptureLength() > 2 { // has captures
+		if match.CaptureLength() > 2 {
 			idx = 2
 		}
+
 		var value LValue
 		if match.IsPosCapture(idx) {
 			value = L.GetTable(repl, LNumber(match.Capture(idx)))
 		} else {
 			value = L.GetField(repl, str[match.Capture(idx):match.Capture(idx+1)])
 		}
+
 		if !LVIsFalse(value) {
 			infoList = append(infoList, replaceInfo{[]int{match.Capture(0), match.Capture(1)}, LVAsString(value)})
 		}
 	}
+
 	return strGsubDoReplace(str, infoList)
 }
 
 func strGsubFunc(L *LState, str string, repl *LFunction, matches []*pm.MatchData) string {
 	infoList := make([]replaceInfo, 0, len(matches))
+
 	for _, match := range matches {
 		start, end := match.Capture(0), match.Capture(1)
 		L.Push(repl)
+
 		nargs := 0
-		if match.CaptureLength() > 2 { // has captures
+		if match.CaptureLength() > 2 {
 			for i := 2; i < match.CaptureLength(); i += 2 {
 				if match.IsPosCapture(i) {
 					L.Push(LNumber(match.Capture(i)))
@@ -283,12 +298,14 @@ func strGsubFunc(L *LState, str string, repl *LFunction, matches []*pm.MatchData
 			L.Push(LString(capturedString(L, match, str, 0)))
 			nargs++
 		}
+
 		L.Call(nargs, 1)
 		ret := L.reg.Pop()
 		if !LVIsFalse(ret) {
 			infoList = append(infoList, replaceInfo{[]int{start, end}, LVAsString(ret)})
 		}
 	}
+
 	return strGsubDoReplace(str, infoList)
 }
 
@@ -303,12 +320,15 @@ func strGmatchIter(L *LState) int {
 	str := md.str
 	matches := md.matches
 	idx := md.pos
-	md.pos += 1
+	md.pos++
+
 	if idx == len(matches) {
 		return 0
 	}
+
 	L.Push(L.Get(1))
 	match := matches[idx]
+
 	if match.CaptureLength() == 2 {
 		L.Push(LString(str[match.Capture(0):match.Capture(1)]))
 		return 1
@@ -327,10 +347,12 @@ func strGmatchIter(L *LState) int {
 func strGmatch(L *LState) int {
 	str := L.CheckString(1)
 	pattern := L.CheckString(2)
+
 	mds, err := pm.Find(pattern, []byte(str), 0, -1)
 	if err != nil {
 		L.RaiseError(err.Error())
 	}
+
 	L.Push(L.Get(UpvalueIndex(1)))
 	ud := L.NewUserData()
 	ud.Value = &strMatchData{str, 0, mds}
@@ -339,14 +361,12 @@ func strGmatch(L *LState) int {
 }
 
 func strLen(L *LState) int {
-	str := L.CheckString(1)
-	L.Push(LNumber(len(str)))
+	L.Push(LNumber(len(L.CheckString(1))))
 	return 1
 }
 
 func strLower(L *LState) int {
-	str := L.CheckString(1)
-	L.Push(LString(strings.ToLower(str)))
+	L.Push(LString(strings.ToLower(L.CheckString(1))))
 	return 1
 }
 
@@ -355,6 +375,7 @@ func strMatch(L *LState) int {
 	pattern := L.CheckString(2)
 	offset := L.OptInt(3, 1)
 	l := len(str)
+
 	if offset < 0 {
 		offset = l + offset + 1
 	}
@@ -371,8 +392,10 @@ func strMatch(L *LState) int {
 		L.Push(LNil)
 		return 0
 	}
+
 	md := mds[0]
 	nsubs := md.CaptureLength() / 2
+
 	switch nsubs {
 	case 1:
 		L.Push(LString(str[md.Capture(0):md.Capture(1)]))
@@ -392,6 +415,7 @@ func strMatch(L *LState) int {
 func strRep(L *LState) int {
 	str := L.CheckString(1)
 	n := L.CheckInt(2)
+
 	if n < 0 {
 		L.Push(emptyLString)
 	} else {
@@ -404,10 +428,12 @@ func strReverse(L *LState) int {
 	str := L.CheckString(1)
 	bts := []byte(str)
 	out := make([]byte, len(bts))
+
 	for i, j := 0, len(bts)-1; j >= 0; i, j = i+1, j-1 {
 		out[i] = bts[j]
 	}
-	L.Push(LString(string(out)))
+
+	L.Push(LString(out))
 	return 1
 }
 
@@ -416,6 +442,7 @@ func strSub(L *LState) int {
 	start := luaIndex2StringIndex(str, L.CheckInt(2), true)
 	end := luaIndex2StringIndex(str, L.OptInt(3, -1), false)
 	l := len(str)
+
 	if start >= l || end < start {
 		L.Push(emptyLString)
 	} else {
@@ -425,14 +452,13 @@ func strSub(L *LState) int {
 }
 
 func strUpper(L *LState) int {
-	str := L.CheckString(1)
-	L.Push(LString(strings.ToUpper(str)))
+	L.Push(LString(strings.ToUpper(L.CheckString(1))))
 	return 1
 }
 
 func luaIndex2StringIndex(str string, i int, start bool) int {
 	if start && i != 0 {
-		i -= 1
+		i--
 	}
 	l := len(str)
 	if i < 0 {

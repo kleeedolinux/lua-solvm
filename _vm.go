@@ -7,9 +7,6 @@ import (
 )
 
 func mainLoop(L *LState, baseframe *callFrame) {
-	var inst uint32
-	var cf *callFrame
-
 	if L.stack.IsEmpty() {
 		return
 	}
@@ -20,20 +17,23 @@ func mainLoop(L *LState, baseframe *callFrame) {
 		return
 	}
 
+	cf := L.currentFrame
+	code := cf.Fn.Proto.Code
+	pc := cf.Pc
+	reg := L.reg
+	lbase := cf.LocalBase
+
 	for {
-		cf = L.currentFrame
-		inst = cf.Fn.Proto.Code[cf.Pc]
-		cf.Pc++
+		inst := code[pc]
+		pc++
 		if jumpTable[int(inst>>26)](L, inst, baseframe) == 1 {
 			return
 		}
+		cf.Pc = pc
 	}
 }
 
 func mainLoopWithContext(L *LState, baseframe *callFrame) {
-	var inst uint32
-	var cf *callFrame
-
 	if L.stack.IsEmpty() {
 		return
 	}
@@ -44,10 +44,15 @@ func mainLoopWithContext(L *LState, baseframe *callFrame) {
 		return
 	}
 
+	cf := L.currentFrame
+	code := cf.Fn.Proto.Code
+	pc := cf.Pc
+	reg := L.reg
+	lbase := cf.LocalBase
+
 	for {
-		cf = L.currentFrame
-		inst = cf.Fn.Proto.Code[cf.Pc]
-		cf.Pc++
+		inst := code[pc]
+		pc++
 		select {
 		case <-L.ctx.Done():
 			L.RaiseError(L.ctx.Err().Error())
@@ -57,6 +62,7 @@ func mainLoopWithContext(L *LState, baseframe *callFrame) {
 				return
 			}
 		}
+		cf.Pc = pc
 	}
 }
 
@@ -828,7 +834,7 @@ func init() {
 	}
 }
 
-func opArith(L *LState, inst uint32, baseframe *callFrame) int { //OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_MOD, OP_POW
+func opArith(L *LState, inst uint32, baseframe *callFrame) int {
 	reg := L.reg
 	cf := L.currentFrame
 	lbase := cf.LocalBase
@@ -837,17 +843,28 @@ func opArith(L *LState, inst uint32, baseframe *callFrame) int { //OP_ADD, OP_SU
 	opcode := int(inst >> 26) //GETOPCODE
 	B := int(inst & 0x1ff)    //GETB
 	C := int(inst>>9) & 0x1ff //GETC
+
 	lhs := L.rkValue(B)
 	rhs := L.rkValue(C)
-	v1, ok1 := lhs.(LNumber)
-	v2, ok2 := rhs.(LNumber)
-	if ok1 && ok2 {
-		v := numberArith(L, opcode, LNumber(v1), LNumber(v2))
-		// +inline-call reg.SetNumber RA v
-	} else {
-		v := objectArith(L, opcode, lhs, rhs)
-		// +inline-call reg.Set RA v
+
+	switch l := lhs.(type) {
+	case LNumber:
+		if r, ok := rhs.(LNumber); ok {
+			v := numberArith(L, opcode, l, r)
+			reg.SetNumber(RA, v)
+			return 0
+		}
+	case LString:
+		if r, ok := rhs.(LString); ok {
+			if opcode == OP_ADD {
+				reg.Set(RA, LString(string(l)+string(r)))
+				return 0
+			}
+		}
 	}
+
+	v := objectArith(L, opcode, lhs, rhs)
+	reg.Set(RA, v)
 	return 0
 }
 
@@ -874,12 +891,9 @@ func numberArith(L *LState, opcode int, lhs, rhs LNumber) LNumber {
 	case OP_MOD:
 		return luaModulo(lhs, rhs)
 	case OP_POW:
-		flhs := float64(lhs)
-		frhs := float64(rhs)
-		return LNumber(math.Pow(flhs, frhs))
+		return LNumber(math.Pow(float64(lhs), float64(rhs)))
 	}
-	panic("should not reach here")
-	return LNumber(0)
+	return 0
 }
 
 func objectArith(L *LState, opcode int, lhs, rhs LValue) LValue {
@@ -898,127 +912,153 @@ func objectArith(L *LState, opcode int, lhs, rhs LValue) LValue {
 	case OP_POW:
 		event = "__pow"
 	}
+
 	op := L.metaOp2(lhs, rhs, event)
-	if _, ok := op.(*LFunction); ok {
-		L.reg.Push(op)
+	if fn, ok := op.(*LFunction); ok {
+		L.reg.Push(fn)
 		L.reg.Push(lhs)
 		L.reg.Push(rhs)
 		L.Call(2, 1)
 		return L.reg.Pop()
 	}
+
 	if str, ok := lhs.(LString); ok {
-		if lnum, err := parseNumber(string(str)); err == nil {
-			lhs = lnum
+		if num, err := parseNumber(string(str)); err == nil {
+			lhs = num
 		}
 	}
 	if str, ok := rhs.(LString); ok {
-		if rnum, err := parseNumber(string(str)); err == nil {
-			rhs = rnum
+		if num, err := parseNumber(string(str)); err == nil {
+			rhs = num
 		}
 	}
+
 	if v1, ok1 := lhs.(LNumber); ok1 {
 		if v2, ok2 := rhs.(LNumber); ok2 {
-			return numberArith(L, opcode, LNumber(v1), LNumber(v2))
+			return numberArith(L, opcode, v1, v2)
 		}
 	}
-	L.RaiseError(fmt.Sprintf("cannot perform %v operation between %v and %v",
-		strings.TrimLeft(event, "_"), lhs.Type().String(), rhs.Type().String()))
 
+	L.RaiseError("cannot perform %v operation between %v and %v",
+		strings.TrimLeft(event, "_"), lhs.Type().String(), rhs.Type().String())
 	return LNil
 }
 
 func stringConcat(L *LState, total, last int) LValue {
 	rhs := L.reg.Get(last)
 	total--
-	for i := last - 1; total > 0; {
+
+	if total == 0 {
+		return rhs
+	}
+
+	var builder strings.Builder
+	builder.Grow(total * 8) // Pre-allocate space for better performance
+
+	if LVCanConvToString(rhs) {
+		builder.WriteString(LVAsString(rhs))
+	} else {
+		op := L.metaOp2(L.reg.Get(last-1), rhs, "__concat")
+		if op.Type() == LTFunction {
+			L.reg.Push(op)
+			L.reg.Push(L.reg.Get(last - 1))
+			L.reg.Push(rhs)
+			L.Call(2, 1)
+			rhs = L.reg.Pop()
+			if !LVCanConvToString(rhs) {
+				L.RaiseError("cannot perform concat operation")
+				return LNil
+			}
+			builder.WriteString(LVAsString(rhs))
+		} else {
+			L.RaiseError("cannot perform concat operation")
+			return LNil
+		}
+	}
+
+	for i := last - 1; total > 0; i-- {
 		lhs := L.reg.Get(i)
-		if !(LVCanConvToString(lhs) && LVCanConvToString(rhs)) {
-			op := L.metaOp2(lhs, rhs, "__concat")
+		if !LVCanConvToString(lhs) {
+			op := L.metaOp2(lhs, LString(builder.String()), "__concat")
 			if op.Type() == LTFunction {
 				L.reg.Push(op)
 				L.reg.Push(lhs)
-				L.reg.Push(rhs)
+				L.reg.Push(LString(builder.String()))
 				L.Call(2, 1)
 				rhs = L.reg.Pop()
-				total--
-				i--
+				if !LVCanConvToString(rhs) {
+					L.RaiseError("cannot perform concat operation")
+					return LNil
+				}
+				builder.Reset()
+				builder.WriteString(LVAsString(rhs))
 			} else {
-				L.RaiseError("cannot perform concat operation between %v and %v", lhs.Type().String(), rhs.Type().String())
+				L.RaiseError("cannot perform concat operation")
 				return LNil
 			}
 		} else {
-			buf := make([]string, total+1)
-			buf[total] = LVAsString(rhs)
-			for total > 0 {
-				lhs = L.reg.Get(i)
-				if !LVCanConvToString(lhs) {
-					break
-				}
-				buf[total-1] = LVAsString(lhs)
-				i--
-				total--
-			}
-			rhs = LString(strings.Join(buf, ""))
+			builder.WriteString(LVAsString(lhs))
 		}
+		total--
 	}
-	return rhs
+
+	return LString(builder.String())
 }
 
 func lessThan(L *LState, lhs, rhs LValue) bool {
-	// optimization for numbers
-	if v1, ok1 := lhs.(LNumber); ok1 {
-		if v2, ok2 := rhs.(LNumber); ok2 {
-			return v1 < v2
+	switch l := lhs.(type) {
+	case LNumber:
+		if r, ok := rhs.(LNumber); ok {
+			return l < r
 		}
-		L.RaiseError("attempt to compare %v with %v", lhs.Type().String(), rhs.Type().String())
+	case LString:
+		if r, ok := rhs.(LString); ok {
+			return strCmp(string(l), string(r)) < 0
+		}
 	}
+
 	if lhs.Type() != rhs.Type() {
 		L.RaiseError("attempt to compare %v with %v", lhs.Type().String(), rhs.Type().String())
 		return false
 	}
-	ret := false
-	switch lhs.Type() {
-	case LTString:
-		ret = strCmp(string(lhs.(LString)), string(rhs.(LString))) < 0
-	default:
-		ret = objectRationalWithError(L, lhs, rhs, "__lt")
-	}
-	return ret
+
+	return objectRationalWithError(L, lhs, rhs, "__lt")
 }
 
 func equals(L *LState, lhs, rhs LValue, raw bool) bool {
-	lt := lhs.Type()
-	if lt != rhs.Type() {
-		return false
+	if lhs == rhs {
+		return true
 	}
 
-	ret := false
-	switch lt {
-	case LTNil:
-		ret = true
-	case LTNumber:
-		v1, _ := lhs.(LNumber)
-		v2, _ := rhs.(LNumber)
-		ret = v1 == v2
-	case LTBool:
-		ret = bool(lhs.(LBool)) == bool(rhs.(LBool))
-	case LTString:
-		ret = string(lhs.(LString)) == string(rhs.(LString))
-	case LTUserData, LTTable:
-		if lhs == rhs {
-			ret = true
-		} else if !raw {
-			switch objectRational(L, lhs, rhs, "__eq") {
-			case 1:
-				ret = true
-			default:
-				ret = false
-			}
+	switch l := lhs.(type) {
+	case LNumber:
+		if r, ok := rhs.(LNumber); ok {
+			return l == r
 		}
-	default:
-		ret = lhs == rhs
+	case LString:
+		if r, ok := rhs.(LString); ok {
+			return string(l) == string(r)
+		}
+	case LBool:
+		if r, ok := rhs.(LBool); ok {
+			return bool(l) == bool(r)
+		}
+	case *LTable:
+		if r, ok := rhs.(*LTable); ok && l == r {
+			return true
+		}
 	}
-	return ret
+
+	if !raw {
+		switch objectRational(L, lhs, rhs, "__eq") {
+		case 1:
+			return true
+		case 0:
+			return false
+		}
+	}
+
+	return false
 }
 
 func objectRationalWithError(L *LState, lhs, rhs LValue, event string) bool {

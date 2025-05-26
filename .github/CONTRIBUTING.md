@@ -21,7 +21,7 @@ Our workflow is based on the [github-flow](https://guides.github.com/introductio
 2. Fork the project.
 3. Clone your fork and add the upstream.
     ```bash
-    git remote add upstream https://github.com/yuin/gopher-lua.git
+    git remote add upstream https://github.com/kleeedolinux/lua-solvm.git
     ```
 
 4. Pull new changes from the upstream.
