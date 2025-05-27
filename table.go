@@ -1,7 +1,20 @@
 package lua
 
-const defaultArrayCap = 32
-const defaultHashCap = 32
+import (
+	"sync"
+)
+
+const (
+	defaultArrayCap = 32
+	defaultHashCap  = 32
+	maxArraySize    = 1 << 30
+)
+
+var tablePool = sync.Pool{
+	New: func() interface{} {
+		return newLTable(defaultArrayCap, defaultHashCap)
+	},
+}
 
 type lValueArraySorter struct {
 	L      *LState
@@ -44,6 +57,44 @@ func newLTable(acap int, hcap int) *LTable {
 		tb.strdict = make(map[string]LValue, hcap)
 	}
 	return tb
+}
+
+func GetTable() *LTable {
+	return tablePool.Get().(*LTable)
+}
+
+func (tb *LTable) Release() {
+	if tb != nil {
+		tb.Reset()
+		tablePool.Put(tb)
+	}
+}
+
+func (tb *LTable) Reset() {
+	if tb != nil {
+		tb.Metatable = LNil
+		if tb.array != nil {
+			tb.array = tb.array[:0]
+		}
+		if tb.strdict != nil {
+			for k := range tb.strdict {
+				delete(tb.strdict, k)
+			}
+		}
+		if tb.dict != nil {
+			for k := range tb.dict {
+				delete(tb.dict, k)
+			}
+		}
+		if tb.keys != nil {
+			tb.keys = tb.keys[:0]
+		}
+		if tb.k2i != nil {
+			for k := range tb.k2i {
+				delete(tb.k2i, k)
+			}
+		}
+	}
 }
 
 // Len returns length of this LTable without using __len.
@@ -97,6 +148,15 @@ func (tb *LTable) Insert(i int, value LValue) {
 		return
 	}
 	i -= 1
+	if cap(tb.array) == len(tb.array) {
+		newCap := cap(tb.array) * 2
+		if newCap > maxArraySize {
+			newCap = maxArraySize
+		}
+		newArray := make([]LValue, len(tb.array), newCap)
+		copy(newArray, tb.array)
+		tb.array = newArray
+	}
 	tb.array = append(tb.array, LNil)
 	copy(tb.array[i+1:], tb.array[i:])
 	tb.array[i] = value
@@ -157,10 +217,21 @@ func (tb *LTable) RawSet(key LValue, value LValue) {
 			case index == alen:
 				tb.array = append(tb.array, value)
 			case index > alen:
-				for i := 0; i < (index - alen); i++ {
-					tb.array = append(tb.array, LNil)
+				if index >= maxArraySize {
+					tb.RawSetH(key, value)
+					return
 				}
-				tb.array = append(tb.array, value)
+				newCap := index + 1
+				if newCap > cap(tb.array) {
+					newCap = cap(tb.array) * 2
+					if newCap > maxArraySize {
+						newCap = maxArraySize
+					}
+				}
+				newArray := make([]LValue, index+1, newCap)
+				copy(newArray, tb.array)
+				newArray[index] = value
+				tb.array = newArray
 			case index < alen:
 				tb.array[index] = value
 			}
@@ -170,7 +241,6 @@ func (tb *LTable) RawSet(key LValue, value LValue) {
 		tb.RawSetString(string(v), value)
 		return
 	}
-
 	tb.RawSetH(key, value)
 }
 
@@ -181,7 +251,7 @@ func (tb *LTable) RawSetInt(key int, value LValue) {
 		return
 	}
 	if tb.array == nil {
-		tb.array = make([]LValue, 0, 32)
+		tb.array = make([]LValue, 0, defaultArrayCap)
 	}
 	index := key - 1
 	alen := len(tb.array)
@@ -189,10 +259,21 @@ func (tb *LTable) RawSetInt(key int, value LValue) {
 	case index == alen:
 		tb.array = append(tb.array, value)
 	case index > alen:
-		for i := 0; i < (index - alen); i++ {
-			tb.array = append(tb.array, LNil)
+		if index >= maxArraySize {
+			tb.RawSetH(LNumber(key), value)
+			return
 		}
-		tb.array = append(tb.array, value)
+		newCap := index + 1
+		if newCap > cap(tb.array) {
+			newCap = cap(tb.array) * 2
+			if newCap > maxArraySize {
+				newCap = maxArraySize
+			}
+		}
+		newArray := make([]LValue, index+1, newCap)
+		copy(newArray, tb.array)
+		newArray[index] = value
+		tb.array = newArray
 	case index < alen:
 		tb.array[index] = value
 	}
@@ -204,13 +285,19 @@ func (tb *LTable) RawSetString(key string, value LValue) {
 		tb.strdict = make(map[string]LValue, defaultHashCap)
 	}
 	if tb.keys == nil {
-		tb.keys = []LValue{}
-		tb.k2i = map[LValue]int{}
+		tb.keys = make([]LValue, 0, defaultHashCap)
+		tb.k2i = make(map[LValue]int, defaultHashCap)
 	}
 
 	if value == LNil {
-		// TODO tb.keys and tb.k2i should also be removed
 		delete(tb.strdict, key)
+		if idx, ok := tb.k2i[LString(key)]; ok {
+			delete(tb.k2i, LString(key))
+			tb.keys = append(tb.keys[:idx], tb.keys[idx+1:]...)
+			for i := idx; i < len(tb.keys); i++ {
+				tb.k2i[tb.keys[i]] = i
+			}
+		}
 	} else {
 		tb.strdict[key] = value
 		lkey := LString(key)
@@ -228,16 +315,22 @@ func (tb *LTable) RawSetH(key LValue, value LValue) {
 		return
 	}
 	if tb.dict == nil {
-		tb.dict = make(map[LValue]LValue, len(tb.strdict))
+		tb.dict = make(map[LValue]LValue, defaultHashCap)
 	}
 	if tb.keys == nil {
-		tb.keys = []LValue{}
-		tb.k2i = map[LValue]int{}
+		tb.keys = make([]LValue, 0, defaultHashCap)
+		tb.k2i = make(map[LValue]int, defaultHashCap)
 	}
 
 	if value == LNil {
-		// TODO tb.keys and tb.k2i should also be removed
 		delete(tb.dict, key)
+		if idx, ok := tb.k2i[key]; ok {
+			delete(tb.k2i, key)
+			tb.keys = append(tb.keys[:idx], tb.keys[idx+1:]...)
+			for i := idx; i < len(tb.keys); i++ {
+				tb.k2i[tb.keys[i]] = i
+			}
+		}
 	} else {
 		tb.dict[key] = value
 		if _, ok := tb.k2i[key]; !ok {
@@ -265,18 +358,12 @@ func (tb *LTable) RawGet(key LValue) LValue {
 		if tb.strdict == nil {
 			return LNil
 		}
-		if ret, ok := tb.strdict[string(v)]; ok {
-			return ret
-		}
-		return LNil
+		return tb.strdict[string(v)]
 	}
 	if tb.dict == nil {
 		return LNil
 	}
-	if v, ok := tb.dict[key]; ok {
-		return v
-	}
-	return LNil
+	return tb.dict[key]
 }
 
 // RawGetInt returns an LValue at position `key` without __index metamethod.
@@ -284,7 +371,7 @@ func (tb *LTable) RawGetInt(key int) LValue {
 	if tb.array == nil {
 		return LNil
 	}
-	index := int(key) - 1
+	index := key - 1
 	if index >= len(tb.array) || index < 0 {
 		return LNil
 	}
@@ -297,18 +384,12 @@ func (tb *LTable) RawGetH(key LValue) LValue {
 		if tb.strdict == nil {
 			return LNil
 		}
-		if v, vok := tb.strdict[string(s)]; vok {
-			return v
-		}
-		return LNil
+		return tb.strdict[string(s)]
 	}
 	if tb.dict == nil {
 		return LNil
 	}
-	if v, ok := tb.dict[key]; ok {
-		return v
-	}
-	return LNil
+	return tb.dict[key]
 }
 
 // RawGetString returns an LValue associated with a given key without __index metamethod.
@@ -316,10 +397,7 @@ func (tb *LTable) RawGetString(key string) LValue {
 	if tb.strdict == nil {
 		return LNil
 	}
-	if v, vok := tb.strdict[string(key)]; vok {
-		return v
-	}
-	return LNil
+	return tb.strdict[key]
 }
 
 // ForEach iterates over this table of elements, yielding each in turn to a given function.
@@ -369,18 +447,22 @@ func (tb *LTable) Next(key LValue) (LValue, LValue) {
 				if (tb.dict == nil || len(tb.dict) == 0) && (tb.strdict == nil || len(tb.strdict) == 0) {
 					return LNil, LNil
 				}
-				key = tb.keys[0]
-				if v := tb.RawGetH(key); v != LNil {
-					return key, v
+				if len(tb.keys) > 0 {
+					key = tb.keys[0]
+					if v := tb.RawGetH(key); v != LNil {
+						return key, v
+					}
 				}
 			}
 		}
 	}
 
-	for i := tb.k2i[key] + 1; i < len(tb.keys); i++ {
-		key := tb.keys[i]
-		if v := tb.RawGetH(key); v != LNil {
-			return key, v
+	if idx, ok := tb.k2i[key]; ok && idx+1 < len(tb.keys) {
+		for i := idx + 1; i < len(tb.keys); i++ {
+			key := tb.keys[i]
+			if v := tb.RawGetH(key); v != LNil {
+				return key, v
+			}
 		}
 	}
 	return LNil, LNil
