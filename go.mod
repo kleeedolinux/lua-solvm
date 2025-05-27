@@ -1,4 +1,4 @@
-module github.com/yuin/gopher-lua
+module github.com/kleeedolinux/lua-solvm
 
 go 1.17
 
