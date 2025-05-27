@@ -3,10 +3,31 @@ package pm
 
 import (
 	"fmt"
+	"sync"
 )
 
 const EOS = -1
 const _UNKNOWN = -2
+
+var (
+	matchDataPool = sync.Pool{
+		New: func() interface{} {
+			return &MatchData{
+				captures: make([]uint32, 0, 32),
+			}
+		},
+	}
+	scannerPool = sync.Pool{
+		New: func() interface{} {
+			return &scanner{
+				State: scannerState{
+					Pos:     0,
+					started: false,
+				},
+			}
+		},
+	}
+)
 
 /* Error {{{ */
 
@@ -45,19 +66,35 @@ type MatchData struct {
 	captures []uint32
 }
 
-func newMatchState() *MatchData { return &MatchData{[]uint32{}} }
+func newMatchState() *MatchData {
+	m := matchDataPool.Get().(*MatchData)
+	m.captures = m.captures[:0]
+	return m
+}
 
 func (st *MatchData) addPosCapture(s, pos int) {
-	for s+1 >= len(st.captures) {
-		st.captures = append(st.captures, 0)
+	if s+1 >= len(st.captures) {
+		newCap := len(st.captures) * 2
+		if newCap < s+2 {
+			newCap = s + 2
+		}
+		newCaptures := make([]uint32, newCap)
+		copy(newCaptures, st.captures)
+		st.captures = newCaptures
 	}
 	st.captures[s] = (uint32(pos) << 1) | 1
 	st.captures[s+1] = (uint32(pos) << 1) | 1
 }
 
 func (st *MatchData) setCapture(s, pos int) uint32 {
-	for s >= len(st.captures) {
-		st.captures = append(st.captures, 0)
+	if s >= len(st.captures) {
+		newCap := len(st.captures) * 2
+		if newCap < s+1 {
+			newCap = s + 1
+		}
+		newCaptures := make([]uint32, newCap)
+		copy(newCaptures, st.captures)
+		st.captures = newCaptures
 	}
 	v := st.captures[s]
 	st.captures[s] = (uint32(pos) << 1)
@@ -88,14 +125,11 @@ type scanner struct {
 }
 
 func newScanner(src []byte) *scanner {
-	return &scanner{
-		src: src,
-		State: scannerState{
-			Pos:     0,
-			started: false,
-		},
-		saved: scannerState{},
-	}
+	sc := scannerPool.Get().(*scanner)
+	sc.src = src
+	sc.State.Pos = 0
+	sc.State.started = false
+	return sc
 }
 
 func (sc *scanner) Length() int { return len(sc.src) }
@@ -125,9 +159,8 @@ func (sc *scanner) NextPos() int {
 	}
 	if !sc.State.started {
 		return 0
-	} else {
-		return sc.State.Pos + 1
 	}
+	return sc.State.Pos + 1
 }
 
 func (sc *scanner) Peek() int {
@@ -616,7 +649,12 @@ func Find(p string, src []byte, offset, limit int) (matches []*MatchData, err er
 			}
 		}
 	}()
-	pat := parsePattern(newScanner([]byte(p)), true)
+	sc := newScanner([]byte(p))
+	defer func() {
+		sc.src = nil
+		scannerPool.Put(sc)
+	}()
+	pat := parsePattern(sc, true)
 	insts := compilePattern(pat)
 	matches = []*MatchData{}
 	for sp := offset; sp <= len(src); {

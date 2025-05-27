@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/kleeedolinux/lua-solvm/ast"
 )
@@ -15,6 +16,14 @@ import (
 const EOF = -1
 const whitespace1 = 1<<'\t' | 1<<' '
 const whitespace2 = 1<<'\t' | 1<<'\n' | 1<<'\r' | 1<<' '
+
+var (
+	bufferPool = sync.Pool{
+		New: func() interface{} {
+			return new(bytes.Buffer)
+		},
+	}
+)
 
 type Error struct {
 	Pos     ast.Position
@@ -26,9 +35,8 @@ func (e *Error) Error() string {
 	pos := e.Pos
 	if pos.Line == EOF {
 		return fmt.Sprintf("%v at EOF:   %s\n", pos.Source, e.Message)
-	} else {
-		return fmt.Sprintf("%v line:%d(column:%d) near '%v':   %s\n", pos.Source, pos.Line, pos.Column, e.Token, e.Message)
 	}
+	return fmt.Sprintf("%v line:%d(column:%d) near '%v':   %s\n", pos.Source, pos.Line, pos.Column, e.Token, e.Message)
 }
 
 func writeChar(buf *bytes.Buffer, c int) { buf.WriteByte(byte(c)) }
@@ -46,6 +54,7 @@ func isDigit(ch int) bool {
 type Scanner struct {
 	Pos    ast.Position
 	reader *bufio.Reader
+	buf    *bytes.Buffer
 }
 
 func NewScanner(reader io.Reader, source string) *Scanner {
@@ -56,6 +65,15 @@ func NewScanner(reader io.Reader, source string) *Scanner {
 			Column: 0,
 		},
 		reader: bufio.NewReaderSize(reader, 4096),
+		buf:    bufferPool.Get().(*bytes.Buffer),
+	}
+}
+
+func (sc *Scanner) Close() {
+	if sc.buf != nil {
+		sc.buf.Reset()
+		bufferPool.Put(sc.buf)
+		sc.buf = nil
 	}
 }
 
@@ -75,7 +93,7 @@ func (sc *Scanner) Newline(ch int) {
 	if ch < 0 {
 		return
 	}
-	sc.Pos.Line += 1
+	sc.Pos.Line++
 	sc.Pos.Column = 0
 	next := sc.Peek()
 	if ch == '\n' && next == '\r' || ch == '\r' && next == '\n' {
@@ -114,13 +132,12 @@ func (sc *Scanner) skipWhiteSpace(whitespace int64) int {
 }
 
 func (sc *Scanner) skipComments(ch int) error {
-	// multiline comment
 	if sc.Peek() == '[' {
 		ch = sc.Next()
 		if sc.Peek() == '[' || sc.Peek() == '=' {
-			var buf bytes.Buffer
-			if err := sc.scanMultilineString(sc.Next(), &buf); err != nil {
-				return sc.Error(buf.String(), "invalid multiline comment")
+			sc.buf.Reset()
+			if err := sc.scanMultilineString(sc.Next(), sc.buf); err != nil {
+				return sc.Error(sc.buf.String(), "invalid multiline comment")
 			}
 			return nil
 		}
@@ -151,7 +168,7 @@ func (sc *Scanner) scanDecimal(ch int, buf *bytes.Buffer) error {
 }
 
 func (sc *Scanner) scanNumber(ch int, buf *bytes.Buffer) error {
-	if ch == '0' { // octal
+	if ch == '0' {
 		if sc.Peek() == 'x' || sc.Peek() == 'X' {
 			writeChar(buf, ch)
 			writeChar(buf, sc.Next())
@@ -179,7 +196,6 @@ func (sc *Scanner) scanNumber(ch int, buf *bytes.Buffer) error {
 		}
 		sc.scanDecimal(sc.Next(), buf)
 	}
-
 	return nil
 }
 
@@ -231,7 +247,8 @@ func (sc *Scanner) scanEscape(ch int, buf *bytes.Buffer) error {
 		sc.Newline('\r')
 	default:
 		if '0' <= ch && ch <= '9' {
-			bytes := []byte{byte(ch)}
+			bytes := make([]byte, 1, 3)
+			bytes[0] = byte(ch)
 			for i := 0; i < 2 && isDecimal(sc.Peek()); i++ {
 				bytes = append(bytes, byte(sc.Next()))
 			}
@@ -246,7 +263,7 @@ func (sc *Scanner) scanEscape(ch int, buf *bytes.Buffer) error {
 
 func (sc *Scanner) countSep(ch int) (int, int) {
 	count := 0
-	for ; ch == '='; count = count + 1 {
+	for ; ch == '='; count++ {
 		ch = sc.Next()
 	}
 	return count, ch
@@ -268,7 +285,7 @@ func (sc *Scanner) scanMultilineString(ch int, buf *bytes.Buffer) error {
 		} else if ch == ']' {
 			count2, ch = sc.countSep(sc.Next())
 			if count1 == count2 && ch == ']' {
-				goto finally
+				return nil
 			}
 			buf.WriteByte(']')
 			buf.WriteString(strings.Repeat("=", count2))
@@ -277,9 +294,6 @@ func (sc *Scanner) scanMultilineString(ch int, buf *bytes.Buffer) error {
 		writeChar(buf, ch)
 		ch = sc.Next()
 	}
-
-finally:
-	return nil
 }
 
 var reservedWords = map[string]int{
@@ -307,15 +321,14 @@ redo:
 		lexer.PNewLine = false
 	}
 
-	var _buf bytes.Buffer
-	buf := &_buf
+	sc.buf.Reset()
 	tok.Pos = sc.Pos
 
 	switch {
 	case isIdent(ch, 0):
 		tok.Type = TIdent
-		err = sc.scanIdent(ch, buf)
-		tok.Str = buf.String()
+		err = sc.scanIdent(ch, sc.buf)
+		tok.Str = sc.buf.String()
 		if err != nil {
 			goto finally
 		}
@@ -324,8 +337,8 @@ redo:
 		}
 	case isDecimal(ch):
 		tok.Type = TNumber
-		err = sc.scanNumber(ch, buf)
-		tok.Str = buf.String()
+		err = sc.scanNumber(ch, sc.buf)
+		tok.Str = sc.buf.String()
 	default:
 		switch ch {
 		case EOF:
@@ -343,13 +356,13 @@ redo:
 			}
 		case '"', '\'':
 			tok.Type = TString
-			err = sc.scanString(ch, buf)
-			tok.Str = buf.String()
+			err = sc.scanString(ch, sc.buf)
+			tok.Str = sc.buf.String()
 		case '[':
 			if c := sc.Peek(); c == '[' || c == '=' {
 				tok.Type = TString
-				err = sc.scanMultilineString(sc.Next(), buf)
-				tok.Str = buf.String()
+				err = sc.scanMultilineString(sc.Next(), sc.buf)
+				tok.Str = sc.buf.String()
 			} else {
 				tok.Type = ch
 				tok.Str = string(rune(ch))
@@ -394,13 +407,13 @@ redo:
 			switch {
 			case isDecimal(ch2):
 				tok.Type = TNumber
-				err = sc.scanNumber(ch, buf)
-				tok.Str = buf.String()
+				err = sc.scanNumber(ch, sc.buf)
+				tok.Str = sc.buf.String()
 			case ch2 == '.':
-				writeChar(buf, ch)
-				writeChar(buf, sc.Next())
+				writeChar(sc.buf, ch)
+				writeChar(sc.buf, sc.Next())
 				if sc.Peek() == '.' {
-					writeChar(buf, sc.Next())
+					writeChar(sc.buf, sc.Next())
 					tok.Type = T3Comma
 				} else {
 					tok.Type = T2Comma
@@ -408,7 +421,7 @@ redo:
 			default:
 				tok.Type = '.'
 			}
-			tok.Str = buf.String()
+			tok.Str = sc.buf.String()
 		case ':':
 			if sc.Peek() == ':' {
 				tok.Type = T2Colon
@@ -422,8 +435,8 @@ redo:
 			tok.Type = ch
 			tok.Str = string(rune(ch))
 		default:
-			writeChar(buf, ch)
-			err = sc.Error(buf.String(), "Invalid token")
+			writeChar(sc.buf, ch)
+			err = sc.Error(sc.buf.String(), "Invalid token")
 			goto finally
 		}
 	}
@@ -472,6 +485,7 @@ func Parse(reader io.Reader, name string) (chunk []ast.Stmt, err error) {
 		if e := recover(); e != nil {
 			err, _ = e.(error)
 		}
+		lexer.scanner.Close()
 	}()
 	yyParse(lexer)
 	chunk = lexer.Stmts
@@ -498,7 +512,7 @@ func dump(node interface{}, level int, s string) string {
 	}
 
 	rv := reflect.ValueOf(node)
-	buf := []string{}
+	buf := make([]string, 0, 16)
 	switch rt.Kind() {
 	case reflect.Slice:
 		if rv.Len() == 0 {
@@ -510,7 +524,7 @@ func dump(node interface{}, level int, s string) string {
 	case reflect.Ptr:
 		vt := rv.Elem()
 		tt := rt.Elem()
-		indicies := []int{}
+		indicies := make([]int, 0, tt.NumField())
 		for i := 0; i < tt.NumField(); i++ {
 			if strings.Index(tt.Field(i).Name, "Base") > -1 {
 				continue
