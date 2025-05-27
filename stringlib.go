@@ -12,7 +12,22 @@ const emptyLString LString = LString("")
 
 var (
 	stringInternCache sync.Map
+	stringBuilderPool sync.Pool
+	byteBufferPool    sync.Pool
 )
+
+func init() {
+	stringBuilderPool = sync.Pool{
+		New: func() interface{} {
+			return new(strings.Builder)
+		},
+	}
+	byteBufferPool = sync.Pool{
+		New: func() interface{} {
+			return make([]byte, 0, 1024)
+		},
+	}
+}
 
 func internString(s string) LString {
 	if cached, ok := stringInternCache.Load(s); ok {
@@ -126,7 +141,7 @@ func strFind(L *LState) int {
 		return 2
 	}
 
-	mds, err := pm.Find(pattern, unsafeFastStringToReadOnlyBytes(str), init, 1)
+	mds, err := pm.Find(pattern, []byte(str), init, 1)
 	if err != nil {
 		L.RaiseError(err.Error())
 	}
@@ -166,7 +181,7 @@ func strGsub(L *LState) int {
 	repl := L.CheckAny(3)
 	limit := L.OptInt(4, -1)
 
-	mds, err := pm.Find(pat, unsafeFastStringToReadOnlyBytes(str), 0, limit)
+	mds, err := pm.Find(pat, []byte(str), 0, limit)
 	if err != nil {
 		L.RaiseError(err.Error())
 	}
@@ -175,127 +190,63 @@ func strGsub(L *LState) int {
 		L.Push(LNumber(0))
 		return 2
 	}
-	switch lv := repl.(type) {
-	case LString:
-		L.Push(internString(strGsubStr(L, str, string(lv), mds)))
-	case *LTable:
-		L.Push(internString(strGsubTable(L, str, lv, mds)))
-	case *LFunction:
-		L.Push(internString(strGsubFunc(L, str, lv, mds)))
-	}
-	L.Push(LNumber(len(mds)))
-	return 2
-}
 
-type replaceInfo struct {
-	Indicies []int
-	String   string
-}
+	builder := stringBuilderPool.Get().(*strings.Builder)
+	defer stringBuilderPool.Put(builder)
+	builder.Reset()
+	builder.Grow(len(str) + len(mds)*10)
 
-func checkCaptureIndex(L *LState, m *pm.MatchData, idx int) {
-	if idx <= 2 {
-		return
-	}
-	if idx >= m.CaptureLength() {
-		L.RaiseError("invalid capture index")
-	}
-}
-
-func capturedString(L *LState, m *pm.MatchData, str string, idx int) string {
-	checkCaptureIndex(L, m, idx)
-	if idx >= m.CaptureLength() && idx == 2 {
-		idx = 0
-	}
-	if m.IsPosCapture(idx) {
-		return fmt.Sprint(m.Capture(idx))
-	} else {
-		return str[m.Capture(idx):m.Capture(idx+1)]
-	}
-}
-
-func strGsubDoReplace(str string, info []replaceInfo) string {
-	var builder strings.Builder
 	offset := 0
-	for _, replace := range info {
-		builder.WriteString(str[offset:replace.Indicies[0]])
-		builder.WriteString(replace.String)
-		offset = replace.Indicies[1]
-	}
-	builder.WriteString(str[offset:])
-	return builder.String()
-}
-
-func strGsubStr(L *LState, str string, repl string, matches []*pm.MatchData) string {
-	infoList := make([]replaceInfo, 0, len(matches))
-	for _, match := range matches {
+	for _, match := range mds {
 		start, end := match.Capture(0), match.Capture(1)
-		sc := newFlagScanner('%', "", "", repl)
-		for c, eos := sc.Next(); !eos; c, eos = sc.Next() {
-			if !sc.ChangeFlag {
-				if sc.HasFlag {
-					if c >= '0' && c <= '9' {
-						sc.AppendString(capturedString(L, match, str, 2*(int(c)-48)))
-					} else {
-						sc.AppendChar('%')
-						sc.AppendChar(c)
-					}
-					sc.HasFlag = false
-				} else {
-					sc.AppendChar(c)
-				}
+		builder.WriteString(str[offset:start])
+
+		switch lv := repl.(type) {
+		case LString:
+			builder.WriteString(string(lv))
+		case *LTable:
+			idx := 0
+			if match.CaptureLength() > 2 {
+				idx = 2
 			}
-		}
-		infoList = append(infoList, replaceInfo{[]int{start, end}, sc.String()})
-	}
-	return strGsubDoReplace(str, infoList)
-}
-
-func strGsubTable(L *LState, str string, repl *LTable, matches []*pm.MatchData) string {
-	infoList := make([]replaceInfo, 0, len(matches))
-	for _, match := range matches {
-		idx := 0
-		if match.CaptureLength() > 2 {
-			idx = 2
-		}
-		var value LValue
-		if match.IsPosCapture(idx) {
-			value = L.GetTable(repl, LNumber(match.Capture(idx)))
-		} else {
-			value = L.GetField(repl, str[match.Capture(idx):match.Capture(idx+1)])
-		}
-		if !LVIsFalse(value) {
-			infoList = append(infoList, replaceInfo{[]int{match.Capture(0), match.Capture(1)}, LVAsString(value)})
-		}
-	}
-	return strGsubDoReplace(str, infoList)
-}
-
-func strGsubFunc(L *LState, str string, repl *LFunction, matches []*pm.MatchData) string {
-	infoList := make([]replaceInfo, 0, len(matches))
-	for _, match := range matches {
-		start, end := match.Capture(0), match.Capture(1)
-		L.Push(repl)
-		nargs := 0
-		if match.CaptureLength() > 2 {
-			for i := 2; i < match.CaptureLength(); i += 2 {
-				if match.IsPosCapture(i) {
-					L.Push(LNumber(match.Capture(i)))
-				} else {
-					L.Push(internString(capturedString(L, match, str, i)))
+			var value LValue
+			if match.IsPosCapture(idx) {
+				value = L.GetTable(lv, LNumber(match.Capture(idx)))
+			} else {
+				value = L.GetField(lv, str[match.Capture(idx):match.Capture(idx+1)])
+			}
+			if !LVIsFalse(value) {
+				builder.WriteString(LVAsString(value))
+			}
+		case *LFunction:
+			L.Push(lv)
+			nargs := 0
+			if match.CaptureLength() > 2 {
+				for i := 2; i < match.CaptureLength(); i += 2 {
+					if match.IsPosCapture(i) {
+						L.Push(LNumber(match.Capture(i)))
+					} else {
+						L.Push(internString(str[match.Capture(i):match.Capture(i+1)]))
+					}
+					nargs++
 				}
+			} else {
+				L.Push(internString(str[match.Capture(0):match.Capture(1)]))
 				nargs++
 			}
-		} else {
-			L.Push(internString(capturedString(L, match, str, 0)))
-			nargs++
+			L.Call(nargs, 1)
+			ret := L.reg.Pop()
+			if !LVIsFalse(ret) {
+				builder.WriteString(LVAsString(ret))
+			}
 		}
-		L.Call(nargs, 1)
-		ret := L.reg.Pop()
-		if !LVIsFalse(ret) {
-			infoList = append(infoList, replaceInfo{[]int{start, end}, LVAsString(ret)})
-		}
+		offset = end
 	}
-	return strGsubDoReplace(str, infoList)
+	builder.WriteString(str[offset:])
+
+	L.Push(internString(builder.String()))
+	L.Push(LNumber(len(mds)))
+	return 2
 }
 
 type strMatchData struct {
@@ -352,7 +303,13 @@ func strLen(L *LState) int {
 
 func strLower(L *LState) int {
 	str := L.CheckString(1)
-	L.Push(internString(strings.ToLower(str)))
+	bts := []byte(str)
+	for i := 0; i < len(bts); i++ {
+		if bts[i] >= 'A' && bts[i] <= 'Z' {
+			bts[i] += 32
+		}
+	}
+	L.Push(internString(string(bts)))
 	return 1
 }
 
@@ -369,7 +326,7 @@ func strMatch(L *LState) int {
 		offset = 0
 	}
 
-	mds, err := pm.Find(pattern, unsafeFastStringToReadOnlyBytes(str), offset, 1)
+	mds, err := pm.Find(pattern, []byte(str), offset, 1)
 	if err != nil {
 		L.RaiseError(err.Error())
 	}
@@ -398,10 +355,19 @@ func strMatch(L *LState) int {
 func strRep(L *LState) int {
 	str := L.CheckString(1)
 	n := L.CheckInt(2)
-	if n < 0 {
+	if n <= 0 {
 		L.Push(emptyLString)
+	} else if n == 1 {
+		L.Push(internString(str))
 	} else {
-		L.Push(internString(strings.Repeat(str, n)))
+		builder := stringBuilderPool.Get().(*strings.Builder)
+		defer stringBuilderPool.Put(builder)
+		builder.Reset()
+		builder.Grow(len(str) * n)
+		for i := 0; i < n; i++ {
+			builder.WriteString(str)
+		}
+		L.Push(internString(builder.String()))
 	}
 	return 1
 }
@@ -409,9 +375,10 @@ func strRep(L *LState) int {
 func strReverse(L *LState) int {
 	str := L.CheckString(1)
 	bts := []byte(str)
-	out := make([]byte, len(bts))
-	for i, j := 0, len(bts)-1; j >= 0; i, j = i+1, j-1 {
-		out[i] = bts[j]
+	l := len(bts)
+	out := make([]byte, l)
+	for i := 0; i < l; i++ {
+		out[i] = bts[l-i-1]
 	}
 	L.Push(internString(string(out)))
 	return 1
@@ -432,7 +399,13 @@ func strSub(L *LState) int {
 
 func strUpper(L *LState) int {
 	str := L.CheckString(1)
-	L.Push(internString(strings.ToUpper(str)))
+	bts := []byte(str)
+	for i := 0; i < len(bts); i++ {
+		if bts[i] >= 'a' && bts[i] <= 'z' {
+			bts[i] -= 32
+		}
+	}
+	L.Push(internString(string(bts)))
 	return 1
 }
 

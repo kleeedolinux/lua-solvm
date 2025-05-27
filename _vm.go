@@ -4,12 +4,29 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"sync"
 )
 
-func mainLoop(L *LState, baseframe *callFrame) {
-	var inst uint32
-	var cf *callFrame
+var (
+	instructionPool   sync.Pool
+	stringBuilderPool sync.Pool
+)
 
+func init() {
+	instructionPool = sync.Pool{
+		New: func() interface{} {
+			return make([]uint32, 0, 64)
+		},
+	}
+
+	stringBuilderPool = sync.Pool{
+		New: func() interface{} {
+			return new(strings.Builder)
+		},
+	}
+}
+
+func mainLoop(L *LState, baseframe *callFrame) {
 	if L.stack.IsEmpty() {
 		return
 	}
@@ -20,20 +37,21 @@ func mainLoop(L *LState, baseframe *callFrame) {
 		return
 	}
 
+	cf := L.currentFrame
+	code := cf.Fn.Proto.Code
+	pc := cf.Pc
+
 	for {
-		cf = L.currentFrame
-		inst = cf.Fn.Proto.Code[cf.Pc]
-		cf.Pc++
+		inst := code[pc]
+		pc++
 		if jumpTable[int(inst>>26)](L, inst, baseframe) == 1 {
 			return
 		}
+		cf.Pc = pc
 	}
 }
 
 func mainLoopWithContext(L *LState, baseframe *callFrame) {
-	var inst uint32
-	var cf *callFrame
-
 	if L.stack.IsEmpty() {
 		return
 	}
@@ -44,10 +62,13 @@ func mainLoopWithContext(L *LState, baseframe *callFrame) {
 		return
 	}
 
+	cf := L.currentFrame
+	code := cf.Fn.Proto.Code
+	pc := cf.Pc
+
 	for {
-		cf = L.currentFrame
-		inst = cf.Fn.Proto.Code[cf.Pc]
-		cf.Pc++
+		inst := code[pc]
+		pc++
 		select {
 		case <-L.ctx.Done():
 			L.RaiseError(L.ctx.Err().Error())
@@ -57,6 +78,7 @@ func mainLoopWithContext(L *LState, baseframe *callFrame) {
 				return
 			}
 		}
+		cf.Pc = pc
 	}
 }
 
@@ -67,16 +89,16 @@ func mainLoopWithContext(L *LState, baseframe *callFrame) {
 // n is the desired number of return values.
 // If n more than the available return values then the extra values are set to nil.
 // When this function returns the top of the registry will be set to regv+n.
-func copyReturnValues(L *LState, regv, start, n, b int) { // +inline-start
+func copyReturnValues(L *LState, regv, start, n, b int) {
 	if b == 1 {
-		// +inline-call L.reg.FillNil  regv n
+		L.reg.FillNil(regv, n)
 	} else {
-		// +inline-call L.reg.CopyRange regv start -1 n
+		L.reg.CopyRange(regv, start, -1, n)
 		if b > 1 && n > (b-1) {
-			// +inline-call L.reg.FillNil  regv+b-1 n-(b-1)
+			L.reg.FillNil(regv+b-1, n-(b-1))
 		}
 	}
-} // +inline-end
+}
 
 func switchToParentThread(L *LState, nargs int, haserror bool, kill bool) {
 	parent := L.Parent
@@ -899,8 +921,8 @@ func objectArith(L *LState, opcode int, lhs, rhs LValue) LValue {
 		event = "__pow"
 	}
 	op := L.metaOp2(lhs, rhs, event)
-	if _, ok := op.(*LFunction); ok {
-		L.reg.Push(op)
+	if fn, ok := op.(*LFunction); ok {
+		L.reg.Push(fn)
 		L.reg.Push(lhs)
 		L.reg.Push(rhs)
 		L.Call(2, 1)
@@ -918,18 +940,26 @@ func objectArith(L *LState, opcode int, lhs, rhs LValue) LValue {
 	}
 	if v1, ok1 := lhs.(LNumber); ok1 {
 		if v2, ok2 := rhs.(LNumber); ok2 {
-			return numberArith(L, opcode, LNumber(v1), LNumber(v2))
+			return numberArith(L, opcode, v1, v2)
 		}
 	}
 	L.RaiseError(fmt.Sprintf("cannot perform %v operation between %v and %v",
 		strings.TrimLeft(event, "_"), lhs.Type().String(), rhs.Type().String()))
-
 	return LNil
 }
 
 func stringConcat(L *LState, total, last int) LValue {
 	rhs := L.reg.Get(last)
 	total--
+
+	if total == 0 {
+		return rhs
+	}
+
+	builder := stringBuilderPool.Get().(*strings.Builder)
+	defer stringBuilderPool.Put(builder)
+	builder.Reset()
+
 	for i := last - 1; total > 0; {
 		lhs := L.reg.Get(i)
 		if !(LVCanConvToString(lhs) && LVCanConvToString(rhs)) {
@@ -947,25 +977,23 @@ func stringConcat(L *LState, total, last int) LValue {
 				return LNil
 			}
 		} else {
-			buf := make([]string, total+1)
-			buf[total] = LVAsString(rhs)
+			builder.WriteString(LVAsString(rhs))
 			for total > 0 {
 				lhs = L.reg.Get(i)
 				if !LVCanConvToString(lhs) {
 					break
 				}
-				buf[total-1] = LVAsString(lhs)
+				builder.WriteString(LVAsString(lhs))
 				i--
 				total--
 			}
-			rhs = LString(strings.Join(buf, ""))
+			rhs = LString(builder.String())
 		}
 	}
 	return rhs
 }
 
 func lessThan(L *LState, lhs, rhs LValue) bool {
-	// optimization for numbers
 	if v1, ok1 := lhs.(LNumber); ok1 {
 		if v2, ok2 := rhs.(LNumber); ok2 {
 			return v1 < v2
@@ -976,49 +1004,45 @@ func lessThan(L *LState, lhs, rhs LValue) bool {
 		L.RaiseError("attempt to compare %v with %v", lhs.Type().String(), rhs.Type().String())
 		return false
 	}
-	ret := false
+
 	switch lhs.Type() {
 	case LTString:
-		ret = strCmp(string(lhs.(LString)), string(rhs.(LString))) < 0
+		return strCmp(string(lhs.(LString)), string(rhs.(LString))) < 0
 	default:
-		ret = objectRationalWithError(L, lhs, rhs, "__lt")
+		return objectRationalWithError(L, lhs, rhs, "__lt")
 	}
-	return ret
 }
 
 func equals(L *LState, lhs, rhs LValue, raw bool) bool {
+	if lhs == rhs {
+		return true
+	}
+
 	lt := lhs.Type()
 	if lt != rhs.Type() {
 		return false
 	}
 
-	ret := false
 	switch lt {
-	case LTNil:
-		ret = true
 	case LTNumber:
 		v1, _ := lhs.(LNumber)
 		v2, _ := rhs.(LNumber)
-		ret = v1 == v2
+		return v1 == v2
 	case LTBool:
-		ret = bool(lhs.(LBool)) == bool(rhs.(LBool))
+		return bool(lhs.(LBool)) == bool(rhs.(LBool))
 	case LTString:
-		ret = string(lhs.(LString)) == string(rhs.(LString))
+		return string(lhs.(LString)) == string(rhs.(LString))
 	case LTUserData, LTTable:
-		if lhs == rhs {
-			ret = true
-		} else if !raw {
+		if !raw {
 			switch objectRational(L, lhs, rhs, "__eq") {
 			case 1:
-				ret = true
+				return true
 			default:
-				ret = false
+				return false
 			}
 		}
-	default:
-		ret = lhs == rhs
 	}
-	return ret
+	return false
 }
 
 func objectRationalWithError(L *LState, lhs, rhs LValue, event string) bool {
