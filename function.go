@@ -11,6 +11,7 @@ const (
 	VarArgNeedsArg uint8 = 4
 )
 
+// .
 type DbgLocalInfo struct {
 	Name    string
 	StartPc int
