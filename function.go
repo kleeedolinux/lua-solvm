@@ -191,3 +191,164 @@ func (fn *LFunction) LocalName(regno, pc int) (string, bool) {
 }
 
 /* }}} */
+
+type CallNode struct {
+	Function *FunctionProto
+	Calls    map[*FunctionProto]bool
+	CalledBy map[*FunctionProto]bool
+}
+
+type CallGraph struct {
+	Nodes map[*FunctionProto]*CallNode
+}
+
+func NewCallGraph() *CallGraph {
+	return &CallGraph{
+		Nodes: make(map[*FunctionProto]*CallNode),
+	}
+}
+
+func (cg *CallGraph) AddFunction(fn *FunctionProto) {
+	if _, exists := cg.Nodes[fn]; !exists {
+		cg.Nodes[fn] = &CallNode{
+			Function: fn,
+			Calls:    make(map[*FunctionProto]bool),
+			CalledBy: make(map[*FunctionProto]bool),
+		}
+	}
+}
+
+func (cg *CallGraph) AddCall(caller, callee *FunctionProto) {
+	cg.AddFunction(caller)
+	cg.AddFunction(callee)
+
+	cg.Nodes[caller].Calls[callee] = true
+	cg.Nodes[callee].CalledBy[caller] = true
+}
+
+func (cg *CallGraph) BuildFromProto(proto *FunctionProto) {
+	cg.AddFunction(proto)
+
+	for _, childProto := range proto.FunctionPrototypes {
+		cg.AddCall(proto, childProto)
+		cg.BuildFromProto(childProto)
+	}
+}
+
+func (cg *CallGraph) GetCallers(fn *FunctionProto) []*FunctionProto {
+	if node, exists := cg.Nodes[fn]; exists {
+		callers := make([]*FunctionProto, 0, len(node.CalledBy))
+		for caller := range node.CalledBy {
+			callers = append(callers, caller)
+		}
+		return callers
+	}
+	return nil
+}
+
+func (cg *CallGraph) GetCallees(fn *FunctionProto) []*FunctionProto {
+	if node, exists := cg.Nodes[fn]; exists {
+		callees := make([]*FunctionProto, 0, len(node.Calls))
+		for callee := range node.Calls {
+			callees = append(callees, callee)
+		}
+		return callees
+	}
+	return nil
+}
+
+func (cg *CallGraph) FindHotPaths(threshold int) []*FunctionProto {
+	hotFuncs := make([]*FunctionProto, 0)
+	for _, node := range cg.Nodes {
+		if len(node.CalledBy) >= threshold {
+			hotFuncs = append(hotFuncs, node.Function)
+		}
+	}
+	return hotFuncs
+}
+
+func (cg *CallGraph) FindUnusedFunctions() []*FunctionProto {
+	unused := make([]*FunctionProto, 0)
+	for _, node := range cg.Nodes {
+		if len(node.CalledBy) == 0 && len(node.Calls) > 0 {
+			unused = append(unused, node.Function)
+		}
+	}
+	return unused
+}
+
+func (cg *CallGraph) FindRecursiveFunctions() []*FunctionProto {
+	recursive := make([]*FunctionProto, 0)
+	visited := make(map[*FunctionProto]bool)
+
+	var dfs func(fn *FunctionProto, path map[*FunctionProto]bool)
+	dfs = func(fn *FunctionProto, path map[*FunctionProto]bool) {
+		if path[fn] {
+			recursive = append(recursive, fn)
+			return
+		}
+		if visited[fn] {
+			return
+		}
+
+		visited[fn] = true
+		path[fn] = true
+
+		for callee := range cg.Nodes[fn].Calls {
+			dfs(callee, path)
+		}
+
+		delete(path, fn)
+	}
+
+	for _, node := range cg.Nodes {
+		if !visited[node.Function] {
+			dfs(node.Function, make(map[*FunctionProto]bool))
+		}
+	}
+
+	return recursive
+}
+
+func (cg *CallGraph) Optimize() {
+	hotPaths := cg.FindHotPaths(5)
+	recursive := cg.FindRecursiveFunctions()
+
+	for _, fn := range hotPaths {
+		if fn.NumUsedRegisters > 0 {
+			fn.NumUsedRegisters = optimizeRegisterUsage(fn)
+		}
+	}
+
+	for _, fn := range recursive {
+		optimizeRecursiveFunction(fn)
+	}
+}
+
+func optimizeRegisterUsage(fn *FunctionProto) uint8 {
+	usedRegs := make(map[int]bool)
+	for _, code := range fn.Code {
+		inst := opGetOpCode(code)
+		if inst == OP_GETUPVAL || inst == OP_SETUPVAL {
+			usedRegs[int(code&0xFF)] = true
+		}
+	}
+	return uint8(len(usedRegs))
+}
+
+func optimizeRecursiveFunction(fn *FunctionProto) {
+	if fn.NumParameters > 0 {
+		fn.NumParameters = optimizeParameterCount(fn)
+	}
+}
+
+func optimizeParameterCount(fn *FunctionProto) uint8 {
+	usedParams := make(map[int]bool)
+	for _, code := range fn.Code {
+		inst := opGetOpCode(code)
+		if inst == OP_GETUPVAL || inst == OP_SETUPVAL {
+			usedParams[int(code&0xFF)] = true
+		}
+	}
+	return uint8(len(usedParams))
+}
