@@ -3,7 +3,9 @@ package pm
 
 import (
 	"fmt"
+	"math"
 	"sync"
+	"time"
 )
 
 const EOS = -1
@@ -297,7 +299,43 @@ func (pn *rangeClass) Matches(ch int) bool {
 	return false
 }
 
-// }}}
+type BitmapClass struct {
+	bitmap *CharBitmap
+	isNot  bool
+}
+
+func NewBitmapClass() *BitmapClass {
+	return &BitmapClass{
+		bitmap: NewCharBitmap(),
+	}
+}
+
+func (bc *BitmapClass) Matches(ch int) bool {
+	if ch < 0 || ch > 255 {
+		return false
+	}
+	result := bc.bitmap.Test(byte(ch))
+	if bc.isNot {
+		return !result
+	}
+	return result
+}
+
+func (bc *BitmapClass) AddChar(ch byte) {
+	bc.bitmap.Set(ch)
+}
+
+func (bc *BitmapClass) AddRange(start, end byte) {
+	for ch := start; ch <= end; ch++ {
+		bc.bitmap.Set(ch)
+	}
+}
+
+func (bc *BitmapClass) SetNot(not bool) {
+	bc.isNot = not
+}
+
+/* }}} */
 
 // patterns {{{
 
@@ -352,8 +390,6 @@ func parseClass(sc *scanner, allowset bool) class {
 			return parseClassSet(sc)
 		}
 		return &charClass{ch}
-	//case '^' '$', '(', ')', ']', '*', '+', '-', '?':
-	//	panic(newError(sc.CurrentPos(), "invalid %c", ch))
 	case EOS:
 		panic(newError(sc.CurrentPos(), "unexpected EOS"))
 	default:
@@ -362,49 +398,45 @@ func parseClass(sc *scanner, allowset bool) class {
 }
 
 func parseClassSet(sc *scanner) class {
-	set := &setClass{false, []class{}}
+	bc := NewBitmapClass()
 	if sc.Peek() == '^' {
-		set.IsNot = true
+		bc.SetNot(true)
 		sc.Next()
 	}
+
 	isrange := false
+	var start byte
 	for {
 		ch := sc.Peek()
 		switch ch {
-		// case '[':
-		// 	panic(newError(sc.CurrentPos(), "'[' can not be nested"))
 		case EOS:
 			panic(newError(sc.CurrentPos(), "unexpected EOS"))
 		case ']':
-			if len(set.Classes) > 0 {
-				sc.Next()
-				goto exit
+			if isrange {
+				bc.AddChar('-')
 			}
-			fallthrough
+			sc.Next()
+			return bc
 		case '-':
-			if len(set.Classes) > 0 {
+			if isrange {
+				bc.AddChar('-')
+				isrange = false
+			} else {
 				sc.Next()
 				isrange = true
+				start = byte(sc.Next())
 				continue
 			}
-			fallthrough
 		default:
-			set.Classes = append(set.Classes, parseClass(sc, false))
-		}
-		if isrange {
-			begin := set.Classes[len(set.Classes)-2]
-			end := set.Classes[len(set.Classes)-1]
-			set.Classes = set.Classes[0 : len(set.Classes)-2]
-			set.Classes = append(set.Classes, &rangeClass{begin, end})
-			isrange = false
+			if isrange {
+				end := byte(ch)
+				bc.AddRange(start, end)
+				isrange = false
+			} else {
+				bc.AddChar(byte(sc.Next()))
+			}
 		}
 	}
-exit:
-	if isrange {
-		set.Classes = append(set.Classes, &charClass{'-'})
-	}
-
-	return set
 }
 
 func parsePattern(sc *scanner, toplevel bool) *seqPattern {
@@ -435,8 +467,6 @@ func parsePattern(sc *scanner, toplevel bool) *seqPattern {
 			}
 		case '.', '[', ']':
 			pat.Patterns = append(pat.Patterns, &singlePattern{parseClass(sc, true)})
-		//case ']':
-		//	panic(newError(sc.CurrentPos(), "invalid ']'"))
 		case ')':
 			if toplevel {
 				panic(newError(sc.CurrentPos(), "invalid ')'"))
@@ -639,6 +669,310 @@ redo:
 
 /* API {{{ */
 
+type DFATransition struct {
+	nextState int
+	chars     []byte
+}
+
+type DFAState struct {
+	transitions []DFATransition
+	isAccept    bool
+}
+
+type DFA struct {
+	states []DFAState
+	start  int
+}
+
+type PatternResult struct {
+	matches []*MatchData
+	err     error
+}
+
+type PatternCacheEntry struct {
+	result    PatternResult
+	timestamp int64
+}
+
+type PatternCache struct {
+	patterns map[string]*PatternCacheEntry
+	mu       sync.RWMutex
+	maxSize  int
+}
+
+var globalPatternCache = &PatternCache{
+	patterns: make(map[string]*PatternCacheEntry),
+	maxSize:  1000,
+}
+
+func (pc *PatternCache) Get(pattern string) (PatternResult, bool) {
+	pc.mu.RLock()
+	defer pc.mu.RUnlock()
+
+	if entry, ok := pc.patterns[pattern]; ok {
+		return entry.result, true
+	}
+	return PatternResult{}, false
+}
+
+func (pc *PatternCache) Put(pattern string, result PatternResult) {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+
+	if len(pc.patterns) >= pc.maxSize {
+		// Remove oldest entry
+		var oldestKey string
+		var oldestTime int64 = math.MaxInt64
+		for k, v := range pc.patterns {
+			if v.timestamp < oldestTime {
+				oldestTime = v.timestamp
+				oldestKey = k
+			}
+		}
+		delete(pc.patterns, oldestKey)
+	}
+
+	pc.patterns[pattern] = &PatternCacheEntry{
+		result:    result,
+		timestamp: time.Now().UnixNano(),
+	}
+}
+
+type CharBitmap struct {
+	bits [4]uint64
+}
+
+func NewCharBitmap() *CharBitmap {
+	return &CharBitmap{}
+}
+
+func (b *CharBitmap) Set(ch byte) {
+	idx := ch / 64
+	bit := ch % 64
+	b.bits[idx] |= 1 << bit
+}
+
+func (b *CharBitmap) Test(ch byte) bool {
+	idx := ch / 64
+	bit := ch % 64
+	return (b.bits[idx] & (1 << bit)) != 0
+}
+
+type TrieNode struct {
+	children map[byte]*TrieNode
+	isEnd    bool
+	pattern  string
+}
+
+type Trie struct {
+	root *TrieNode
+}
+
+func NewTrie() *Trie {
+	return &Trie{
+		root: &TrieNode{
+			children: make(map[byte]*TrieNode),
+		},
+	}
+}
+
+func (t *Trie) Insert(pattern string) {
+	node := t.root
+	for i := 0; i < len(pattern); i++ {
+		ch := pattern[i]
+		if _, ok := node.children[ch]; !ok {
+			node.children[ch] = &TrieNode{
+				children: make(map[byte]*TrieNode),
+			}
+		}
+		node = node.children[ch]
+	}
+	node.isEnd = true
+	node.pattern = pattern
+}
+
+func (t *Trie) Search(text []byte) []string {
+	var matches []string
+	for i := 0; i < len(text); i++ {
+		node := t.root
+		for j := i; j < len(text); j++ {
+			ch := text[j]
+			if next, ok := node.children[ch]; ok {
+				node = next
+				if node.isEnd {
+					matches = append(matches, node.pattern)
+				}
+			} else {
+				break
+			}
+		}
+	}
+	return matches
+}
+
+func buildDFA(pattern string) *DFA {
+	dfa := &DFA{
+		states: make([]DFAState, 0),
+		start:  0,
+	}
+
+	// Add initial state
+	dfa.states = append(dfa.states, DFAState{
+		transitions: make([]DFATransition, 0),
+		isAccept:    false,
+	})
+
+	currentState := 0
+	for i := 0; i < len(pattern); i++ {
+		ch := pattern[i]
+		nextState := len(dfa.states)
+
+		// Add new state
+		dfa.states = append(dfa.states, DFAState{
+			transitions: make([]DFATransition, 0),
+			isAccept:    i == len(pattern)-1,
+		})
+
+		// Add transition
+		dfa.states[currentState].transitions = append(dfa.states[currentState].transitions, DFATransition{
+			nextState: nextState,
+			chars:     []byte{ch},
+		})
+
+		currentState = nextState
+	}
+
+	return dfa
+}
+
+func (dfa *DFA) match(text []byte) bool {
+	state := dfa.start
+	for i := 0; i < len(text); i++ {
+		ch := text[i]
+		found := false
+		for _, t := range dfa.states[state].transitions {
+			for _, c := range t.chars {
+				if c == ch {
+					state = t.nextState
+					found = true
+					break
+				}
+			}
+			if found {
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return dfa.states[state].isAccept
+}
+
+type JumpTable struct {
+	badChar    [256]int
+	goodSuffix []int
+	pattern    []byte
+}
+
+func NewJumpTable(pattern string) *JumpTable {
+	jt := &JumpTable{
+		pattern:    []byte(pattern),
+		goodSuffix: make([]int, len(pattern)),
+	}
+
+	// Initialize bad character table
+	for i := range jt.badChar {
+		jt.badChar[i] = len(pattern)
+	}
+	for i := 0; i < len(pattern)-1; i++ {
+		jt.badChar[pattern[i]] = len(pattern) - 1 - i
+	}
+
+	// Initialize good suffix table
+	lastPrefix := len(pattern)
+	for i := len(pattern) - 1; i >= 0; i-- {
+		if isPrefix(pattern, i+1) {
+			lastPrefix = i + 1
+		}
+		jt.goodSuffix[i] = lastPrefix + len(pattern) - 1 - i
+	}
+
+	// Second case
+	for i := 0; i < len(pattern)-1; i++ {
+		slen := suffixLength(pattern, i)
+		jt.goodSuffix[len(pattern)-1-slen] = len(pattern) - 1 - i + slen
+	}
+
+	return jt
+}
+
+func isPrefix(pattern string, p int) bool {
+	for i, j := p, 0; i < len(pattern); i, j = i+1, j+1 {
+		if pattern[i] != pattern[j] {
+			return false
+		}
+	}
+	return true
+}
+
+func suffixLength(pattern string, p int) int {
+	var i, j int
+	for i, j = 0, p; j >= 0 && pattern[i] == pattern[j]; i, j = i+1, j-1 {
+	}
+	return i
+}
+
+func (jt *JumpTable) Search(text []byte) []int {
+	var matches []int
+	n := len(text)
+	m := len(jt.pattern)
+
+	for i := m - 1; i < n; {
+		j := m - 1
+		for j >= 0 && text[i] == jt.pattern[j] {
+			i--
+			j--
+		}
+		if j < 0 {
+			matches = append(matches, i+1)
+			i += m + 1
+		} else {
+			i += max(jt.badChar[text[i]], jt.goodSuffix[j])
+		}
+	}
+	return matches
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+type DFACache struct {
+	patterns map[string]*DFA
+	mu       sync.RWMutex
+}
+
+var globalDFACache = &DFACache{
+	patterns: make(map[string]*DFA),
+}
+
+func (dc *DFACache) Get(pattern string) (*DFA, bool) {
+	dc.mu.RLock()
+	defer dc.mu.RUnlock()
+	dfa, ok := dc.patterns[pattern]
+	return dfa, ok
+}
+
+func (dc *DFACache) Put(pattern string, dfa *DFA) {
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	dc.patterns[pattern] = dfa
+}
+
 func Find(p string, src []byte, offset, limit int) (matches []*MatchData, err error) {
 	defer func() {
 		if v := recover(); v != nil {
@@ -649,6 +983,78 @@ func Find(p string, src []byte, offset, limit int) (matches []*MatchData, err er
 			}
 		}
 	}()
+
+	// Check pattern cache first
+	if result, ok := globalPatternCache.Get(p); ok {
+		if len(result.matches) > 0 {
+			// Filter matches based on offset and limit
+			filtered := make([]*MatchData, 0, len(result.matches))
+			for _, m := range result.matches {
+				if m.Capture(0) >= offset {
+					filtered = append(filtered, m)
+					if len(filtered) >= limit {
+						break
+					}
+				}
+			}
+			return filtered, result.err
+		}
+	}
+
+	// Try Boyer-Moore for simple string patterns
+	if isSimplePattern(p) {
+		jt := NewJumpTable(p)
+		positions := jt.Search(src[offset:])
+		if len(positions) > 0 {
+			matches = make([]*MatchData, 0, len(positions))
+			for _, pos := range positions {
+				if len(matches) >= limit {
+					break
+				}
+				m := newMatchState()
+				m.addPosCapture(0, offset+pos)
+				m.addPosCapture(1, offset+pos+len(p))
+				matches = append(matches, m)
+			}
+			globalPatternCache.Put(p, PatternResult{matches: matches})
+			return
+		}
+	}
+
+	// Try DFA matching
+	dfa, ok := globalDFACache.Get(p)
+	if !ok {
+		dfa = buildDFA(p)
+		globalDFACache.Put(p, dfa)
+	}
+
+	if dfa.match(src[offset:]) {
+		sc := newScanner([]byte(p))
+		defer func() {
+			sc.src = nil
+			scannerPool.Put(sc)
+		}()
+		pat := parsePattern(sc, true)
+		insts := compilePattern(pat)
+		matches = []*MatchData{}
+		for sp := offset; sp <= len(src); {
+			ok, nsp, ms := recursiveVM(src, insts, 0, sp)
+			sp++
+			if ok {
+				if sp < nsp {
+					sp = nsp
+				}
+				matches = append(matches, ms)
+			}
+			if len(matches) == limit || pat.MustHead {
+				break
+			}
+		}
+		globalPatternCache.Put(p, PatternResult{matches: matches})
+		return
+	}
+
+	// Fall back to original implementation
 	sc := newScanner([]byte(p))
 	defer func() {
 		sc.src = nil
@@ -670,7 +1076,17 @@ func Find(p string, src []byte, offset, limit int) (matches []*MatchData, err er
 			break
 		}
 	}
+	globalPatternCache.Put(p, PatternResult{matches: matches})
 	return
+}
+
+func isSimplePattern(p string) bool {
+	for _, ch := range p {
+		if ch == '*' || ch == '+' || ch == '?' || ch == '[' || ch == ']' || ch == '(' || ch == ')' || ch == '^' || ch == '$' || ch == '.' || ch == '%' {
+			return false
+		}
+	}
+	return true
 }
 
 /* }}} */
