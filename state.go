@@ -16,7 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/yuin/gopher-lua/parse"
+	"github.com/kleeedolinux/lua-solvm/parse"
 )
 
 const MultRet = -1
@@ -373,10 +373,19 @@ type registry struct {
 	maxSize int
 	alloc   *allocator
 	handler registryHandler
+	negIndices map[int]LValue  // Store negative indices separately
 }
 
 func newRegistry(handler registryHandler, initialSize int, growBy int, maxSize int, alloc *allocator) *registry {
-	return &registry{make([]LValue, initialSize), 0, growBy, maxSize, alloc, handler}
+	return &registry{
+		array: make([]LValue, initialSize),
+		top: 0,
+		growBy: growBy,
+		maxSize: maxSize,
+		alloc: alloc,
+		handler: handler,
+		negIndices: make(map[int]LValue),
+	}
 }
 
 func (rg *registry) checkSize(requiredSize int) { // +inline-start
@@ -456,6 +465,12 @@ func (rg *registry) Pop() LValue {
 }
 
 func (rg *registry) Get(reg int) LValue {
+	if reg < 0 {
+		if val, ok := rg.negIndices[reg]; ok {
+			return val
+		}
+		return LNil
+	}
 	return rg.array[reg]
 }
 
@@ -596,21 +611,21 @@ func (rg *registry) Insert(value LValue, reg int) {
 	}
 }
 
-func (rg *registry) Set(regi int, vali LValue) { // +inline-start
+func (rg *registry) Set(regi int, vali LValue) {
+	if regi < 0 {
+		rg.negIndices[regi] = vali
+		return
+	}
+	
 	newSize := regi + 1
-	// this section is inlined by go-inline
-	// source function is 'func (rg *registry) checkSize(requiredSize int) ' in '_state.go'
-	{
-		requiredSize := newSize
-		if requiredSize > cap(rg.array) {
-			rg.resize(requiredSize)
-		}
+	if newSize > cap(rg.array) {
+		rg.resize(newSize)
 	}
 	rg.array[regi] = vali
 	if regi >= rg.top {
 		rg.top = regi + 1
 	}
-} // +inline-end
+}
 
 func (rg *registry) SetNumber(regi int, vali LNumber) { // +inline-start
 	newSize := regi + 1
@@ -686,6 +701,12 @@ func newLState(options Options) *LState {
 	}
 	ls.reg = newRegistry(ls, options.RegistrySize, options.RegistryGrowStep, options.RegistryMaxSize, al)
 	ls.Env = ls.G.Global
+	
+	// Initialize registry table in registry array
+	ls.reg.Set(RegistryIndex, ls.G.Registry)
+	ls.reg.Set(GlobalsIndex, ls.G.Global)
+	ls.reg.Set(EnvironIndex, ls.Env)
+	
 	return ls
 }
 

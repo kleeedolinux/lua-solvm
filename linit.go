@@ -15,12 +15,8 @@ const (
 	StringLibName = "string"
 	// MathLibName is the name of the math Library.
 	MathLibName = "math"
-	// DebugLibName is the name of the debug Library.
-	DebugLibName = "debug"
 	// ChannelLibName is the name of the channel Library.
 	ChannelLibName = "channel"
-	// CoroutineLibName is the name of the coroutine Library.
-	CoroutineLibName = "coroutine"
 )
 
 type luaLib struct {
@@ -36,9 +32,7 @@ var luaLibs = []luaLib{
 	luaLib{OsLibName, OpenOs},
 	luaLib{StringLibName, OpenString},
 	luaLib{MathLibName, OpenMath},
-	luaLib{DebugLibName, OpenDebug},
 	luaLib{ChannelLibName, OpenChannel},
-	luaLib{CoroutineLibName, OpenCoroutine},
 }
 
 // OpenLibs loads the built-in libraries. It is equivalent to running OpenLoad,
